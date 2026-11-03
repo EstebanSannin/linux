@@ -10,6 +10,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
+#include <linux/pm_qos.h>
 #include <linux/pm_runtime.h>
 #include <linux/regulator/consumer.h>
 #include <linux/reset.h>
@@ -29,6 +30,14 @@
 #include "state.xml.h"
 #include "state_hi.xml.h"
 #include "cmdstream.xml.h"
+
+static int qos_latency_us = 100;
+module_param(qos_latency_us, int, 0644);
+MODULE_PARM_DESC(qos_latency_us, "CPU wakeup latency (us) requested while the GPU is busy, < 0 disables");
+
+static unsigned int qos_idle_ms = 20;
+module_param(qos_idle_ms, uint, 0644);
+MODULE_PARM_DESC(qos_idle_ms, "Time (ms) after the last job before the CPU latency request is dropped");
 
 static const struct platform_device_id gpu_ids[] = {
 	{ .name = "etnaviv-gpu,2d" },
@@ -1285,6 +1294,9 @@ static void event_free(struct etnaviv_gpu *gpu, unsigned int event)
 		complete(&gpu->event_free);
 	}
 
+	if (qos_latency_us >= 0)
+		mod_delayed_work(system_wq, &gpu->qos_release_work, msecs_to_jiffies(qos_idle_ms));
+
 	pm_runtime_put_autosuspend(gpu->dev);
 }
 
@@ -1419,6 +1431,39 @@ static void sync_point_perfmon_sample_post(struct etnaviv_gpu *gpu,
 
 
 /* add bo's to gpu's ring, and kick gpu: */
+/*
+ * While jobs are in flight, ask for a low CPU wakeup latency. Otherwise the CPUs can enter a deep idle state
+ * during a job (cpu-pd-wait on i.MX8MP: 1.5 ms worst-case wakeup), and both the scheduler thread that starts
+ * the next job and the waiter woken by the completion IRQ pay the exit latency. The request is dropped
+ * qos_idle_ms after the last completion, so back-to-back jobs don't toggle it.
+ */
+static void etnaviv_gpu_qos_release_worker(struct work_struct *work)
+{
+	struct etnaviv_gpu *gpu = container_of(work, struct etnaviv_gpu, qos_release_work.work);
+
+	mutex_lock(&gpu->qos_lock);
+	if (gpu->qos_active) {
+		cpu_latency_qos_update_request(&gpu->qos, PM_QOS_DEFAULT_VALUE);
+		gpu->qos_active = false;
+	}
+	mutex_unlock(&gpu->qos_lock);
+}
+
+static void etnaviv_gpu_qos_busy(struct etnaviv_gpu *gpu)
+{
+	if (qos_latency_us < 0)
+		return;
+
+	cancel_delayed_work(&gpu->qos_release_work);
+
+	mutex_lock(&gpu->qos_lock);
+	if (!gpu->qos_active) {
+		cpu_latency_qos_update_request(&gpu->qos, qos_latency_us);
+		gpu->qos_active = true;
+	}
+	mutex_unlock(&gpu->qos_lock);
+}
+
 struct dma_fence *etnaviv_gpu_submit(struct etnaviv_gem_submit *submit)
 {
 	struct etnaviv_gpu *gpu = submit->gpu;
@@ -1442,6 +1487,8 @@ struct dma_fence *etnaviv_gpu_submit(struct etnaviv_gem_submit *submit)
 		pm_runtime_put_noidle(gpu->dev);
 		return NULL;
 	}
+
+	etnaviv_gpu_qos_busy(gpu);
 
 	mutex_lock(&gpu->lock);
 
@@ -1838,6 +1885,10 @@ static int etnaviv_gpu_bind(struct device *dev, struct device *master,
 	INIT_WORK(&gpu->sync_point_work, sync_point_worker);
 	init_waitqueue_head(&gpu->fence_event);
 
+	mutex_init(&gpu->qos_lock);
+	INIT_DELAYED_WORK(&gpu->qos_release_work, etnaviv_gpu_qos_release_worker);
+	cpu_latency_qos_add_request(&gpu->qos, PM_QOS_DEFAULT_VALUE);
+
 	priv->gpu[priv->num_gpus++] = gpu;
 
 	return 0;
@@ -1861,6 +1912,9 @@ static void etnaviv_gpu_unbind(struct device *dev, struct device *master,
 	struct etnaviv_gpu *gpu = dev_get_drvdata(dev);
 
 	DBG("%s", dev_name(gpu->dev));
+
+	cancel_delayed_work_sync(&gpu->qos_release_work);
+	cpu_latency_qos_remove_request(&gpu->qos);
 
 	destroy_workqueue(gpu->wq);
 

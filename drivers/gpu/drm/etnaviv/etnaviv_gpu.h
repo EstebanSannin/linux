@@ -6,6 +6,7 @@
 #ifndef __ETNAVIV_GPU_H__
 #define __ETNAVIV_GPU_H__
 
+#include <linux/pm_qos.h>
 #include "etnaviv_cmdbuf.h"
 #include "etnaviv_gem.h"
 #include "etnaviv_mmu.h"
@@ -141,6 +142,12 @@ struct etnaviv_gpu {
 
 	/* worker for handling 'sync' points: */
 	struct work_struct sync_point_work;
+
+	/* CPU wakeup latency request held while jobs are in flight */
+	struct pm_qos_request qos;
+	struct delayed_work qos_release_work;
+	struct mutex qos_lock;
+	bool qos_active;
 	int sync_point_event;
 
 	/* hang detection */
