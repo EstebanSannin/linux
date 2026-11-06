@@ -17,6 +17,10 @@ static int etnaviv_job_hang_limit = 0;
 module_param_named(job_hang_limit, etnaviv_job_hang_limit, int , 0444);
 static int etnaviv_hw_jobs_limit = 4;
 module_param_named(hw_job_limit, etnaviv_hw_jobs_limit, int , 0444);
+static int etnaviv_job_timeout_ms = 500;
+module_param_named(job_timeout_ms, etnaviv_job_timeout_ms, int, 0444);
+MODULE_PARM_DESC(job_timeout_ms,
+		 "Hang check period in ms: a job is reset when the GPU made no progress during a full period");
 
 static struct dma_fence *etnaviv_sched_run_job(struct drm_sched_job *sched_job)
 {
@@ -147,7 +151,7 @@ int etnaviv_sched_init(struct etnaviv_gpu *gpu)
 		.num_rqs = DRM_SCHED_PRIORITY_COUNT,
 		.credit_limit = etnaviv_hw_jobs_limit,
 		.hang_limit = etnaviv_job_hang_limit,
-		.timeout = msecs_to_jiffies(500),
+		.timeout = msecs_to_jiffies(max(etnaviv_job_timeout_ms, 1)),
 		.name = dev_name(gpu->dev),
 		.dev = gpu->dev,
 	};
