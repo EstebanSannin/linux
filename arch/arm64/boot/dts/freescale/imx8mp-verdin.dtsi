@@ -796,6 +796,11 @@
 	single-master;
 };
 
+/* Memory-to-memory scaling and colour conversion, also without a camera */
+&isi_0 {
+	status = "okay";
+};
+
 /* Verdin PCIE_1 */
 &pcie {
 	pinctrl-names = "default";
